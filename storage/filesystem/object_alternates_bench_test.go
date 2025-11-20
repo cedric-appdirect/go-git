@@ -18,7 +18,7 @@ import (
 // Setup:
 //   - Creates a "template" repository with 40,000 files in 10 directories
 //   - Files are committed in batches (40 commits of 1,000 files each)
-//   - Creates a "work" repository using alternates to reference the template
+//   - Clones the template using Shared: true (sets up alternates automatically)
 //   - Performs commits in the work repository (testing alternates performance)
 //
 // This benchmark measures the performance improvement from caching ObjectStorage
@@ -109,62 +109,26 @@ func BenchmarkAlternatesPerformance(b *testing.B) {
 	setupDuration := b.Elapsed() - setupStart
 	b.Logf("Template setup complete: %d files, %d commits in %v", fileCount, commitCount, setupDuration)
 
-	// Phase 2: Create work repository with alternates
-	if err := os.MkdirAll(workPath, 0755); err != nil {
-		b.Fatal(err)
-	}
+	// Phase 2: Clone template with Shared: true (sets up alternates automatically)
+	b.Log("Cloning template with Shared: true (alternates)...")
+	cloneStart := b.Elapsed()
 
-	workRepo, err := git.PlainInit(workPath, false)
+	workRepo, err := git.PlainClone(workPath, &git.CloneOptions{
+		URL:    templatePath,
+		Shared: true, // This automatically sets up alternates!
+	})
 	if err != nil {
 		b.Fatal(err)
 	}
 
-	// Set up alternates manually
-	workGitDir := filepath.Join(workPath, ".git")
-	alternatesFile := filepath.Join(workGitDir, "objects", "info", "alternates")
-	
-	if err := os.MkdirAll(filepath.Dir(alternatesFile), 0755); err != nil {
-		b.Fatal(err)
-	}
-
-	templateObjectsPath := filepath.Join(templatePath, ".git", "objects")
-	if err := os.WriteFile(alternatesFile, []byte(templateObjectsPath+"\n"), 0644); err != nil {
-		b.Fatal(err)
-	}
-
-	// Copy refs from template
-	templateRefsPath := filepath.Join(templatePath, ".git", "refs")
-	workRefsPath := filepath.Join(workGitDir, "refs")
-	if err := copyDir(templateRefsPath, workRefsPath); err != nil {
-		b.Fatal(err)
-	}
-
-	// Copy HEAD
-	templateHEAD, err := os.ReadFile(filepath.Join(templatePath, ".git", "HEAD"))
-	if err != nil {
-		b.Fatal(err)
-	}
-	if err := os.WriteFile(filepath.Join(workGitDir, "HEAD"), templateHEAD, 0644); err != nil {
-		b.Fatal(err)
-	}
+	cloneDuration := b.Elapsed() - cloneStart
+	b.Logf("Clone completed in %v (using alternates)", cloneDuration)
 
 	// Get worktree
 	workTree, err := workRepo.Worktree()
 	if err != nil {
 		b.Fatal(err)
 	}
-
-	// Checkout to populate working directory (this tests alternates!)
-	b.Log("Checking out working directory (testing alternates)...")
-	checkoutStart := b.Elapsed()
-	err = workTree.Checkout(&git.CheckoutOptions{
-		Force: true,
-	})
-	if err != nil {
-		b.Fatal(err)
-	}
-	checkoutDuration := b.Elapsed() - checkoutStart
-	b.Logf("Checkout completed in %v (all objects from alternates)", checkoutDuration)
 
 	// Reset timer before benchmarking actual operations
 	b.ResetTimer()
@@ -250,37 +214,12 @@ func BenchmarkAlternatesObjectLookup(b *testing.B) {
 		b.Fatal(err)
 	}
 
-	// Create work repo with alternates
-	workRepo, err := git.PlainInit(workPath, false)
+	// Clone with Shared: true (sets up alternates)
+	workRepo, err := git.PlainClone(workPath, &git.CloneOptions{
+		URL:    templatePath,
+		Shared: true,
+	})
 	if err != nil {
-		b.Fatal(err)
-	}
-
-	// Set up alternates
-	workGitDir := filepath.Join(workPath, ".git")
-	alternatesFile := filepath.Join(workGitDir, "objects", "info", "alternates")
-	if err := os.MkdirAll(filepath.Dir(alternatesFile), 0755); err != nil {
-		b.Fatal(err)
-	}
-
-	templateObjectsPath := filepath.Join(templatePath, ".git", "objects")
-	if err := os.WriteFile(alternatesFile, []byte(templateObjectsPath+"\n"), 0644); err != nil {
-		b.Fatal(err)
-	}
-
-	// Copy refs
-	templateRefsPath := filepath.Join(templatePath, ".git", "refs")
-	workRefsPath := filepath.Join(workGitDir, "refs")
-	if err := copyDir(templateRefsPath, workRefsPath); err != nil {
-		b.Fatal(err)
-	}
-
-	// Copy HEAD
-	templateHEAD, err := os.ReadFile(filepath.Join(templatePath, ".git", "HEAD"))
-	if err != nil {
-		b.Fatal(err)
-	}
-	if err := os.WriteFile(filepath.Join(workGitDir, "HEAD"), templateHEAD, 0644); err != nil {
 		b.Fatal(err)
 	}
 
@@ -319,31 +258,3 @@ func BenchmarkAlternatesObjectLookup(b *testing.B) {
 	}
 }
 
-// copyDir recursively copies a directory
-func copyDir(src, dst string) error {
-	return filepath.Walk(src, func(path string, info os.FileInfo, err error) error {
-		if err != nil {
-			return err
-		}
-
-		// Get relative path
-		relPath, err := filepath.Rel(src, path)
-		if err != nil {
-			return err
-		}
-
-		dstPath := filepath.Join(dst, relPath)
-
-		if info.IsDir() {
-			return os.MkdirAll(dstPath, info.Mode())
-		}
-
-		// Copy file
-		data, err := os.ReadFile(path)
-		if err != nil {
-			return err
-		}
-
-		return os.WriteFile(dstPath, data, info.Mode())
-	})
-}
