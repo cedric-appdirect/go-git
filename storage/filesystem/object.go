@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"io"
 	"os"
+	"sync"
 	"time"
 
 	"github.com/go-git/go-git/v5/plumbing"
@@ -31,6 +32,13 @@ type ObjectStorage struct {
 	packList    []plumbing.Hash
 	packListIdx int
 	packfiles   map[plumbing.Hash]*packfile.Packfile
+
+	// Alternates caching for performance
+	// These fields cache alternate ObjectStorage instances to avoid
+	// repeated initialization overhead when objects are not found locally.
+	alternates     []*ObjectStorage // Cached alternate storages
+	alternatesOnce sync.Once        // Ensures alternates loaded only once
+	alternatesErr  error            // Stores any error from loading alternates
 }
 
 // NewObjectStorage creates a new ObjectStorage with the given .git directory and cache.
@@ -70,6 +78,30 @@ func (s *ObjectStorage) requireIndex() error {
 // Reindex indexes again all packfiles. Useful if git changed packfiles externally
 func (s *ObjectStorage) Reindex() {
 	s.index = nil
+}
+
+// initAlternates initializes the alternates storage cache.
+// It's called lazily via sync.Once when an object is not found locally.
+// This ensures alternates are loaded exactly once, even under concurrent access,
+// providing significant performance improvements for repositories using alternates.
+func (s *ObjectStorage) initAlternates() {
+	s.alternatesOnce.Do(func() {
+		dotgits, err := s.dir.Alternates()
+		if err != nil {
+			s.alternatesErr = err
+			return
+		}
+
+		// Pre-allocate slice to exact size
+		s.alternates = make([]*ObjectStorage, 0, len(dotgits))
+
+		for _, dg := range dotgits {
+			// Create ObjectStorage once for each alternate
+			// Share the object cache for efficiency
+			alt := NewObjectStorageWithOptions(dg, s.objectCache, s.options)
+			s.alternates = append(s.alternates, alt)
+		}
+	})
 }
 
 func (s *ObjectStorage) loadIdxFile(h plumbing.Hash) (err error) {
@@ -304,7 +336,27 @@ func (s *ObjectStorage) EncodedObjectSize(h plumbing.Hash) (
 		return size, nil
 	}
 
-	return s.encodedObjectSizeFromPackfile(h)
+	size, err = s.encodedObjectSizeFromPackfile(h)
+
+	// Check alternates if not found locally (same caching optimization as EncodedObject)
+	if err == plumbing.ErrObjectNotFound {
+		s.initAlternates()
+
+		if s.alternatesErr != nil {
+			return 0, err
+		}
+
+		for _, alt := range s.alternates {
+			size, err = alt.EncodedObjectSize(h)
+			if err == nil {
+				return size, nil
+			}
+		}
+
+		return 0, plumbing.ErrObjectNotFound
+	}
+
+	return size, err
 }
 
 // EncodedObject returns the object with the given hash, by searching for it in
@@ -325,22 +377,28 @@ func (s *ObjectStorage) EncodedObject(t plumbing.ObjectType, h plumbing.Hash) (p
 		}
 	}
 
-	// If the error is still object not found, check if it's a shared object
-	// repository.
+	// If the error is still object not found, check alternates.
+	// Alternates are initialized lazily on first use and cached for reuse.
 	if err == plumbing.ErrObjectNotFound {
-		dotgits, e := s.dir.Alternates()
-		if e == nil {
-			// Create a new object storage with the DotGit(s) and check for the
-			// required hash object. Skip when not found.
-			for _, dg := range dotgits {
-				o := NewObjectStorage(dg, s.objectCache)
-				enobj, enerr := o.EncodedObject(t, h)
-				if enerr != nil {
-					continue
-				}
-				return enobj, nil
-			}
+		// Initialize alternates on first use (lazy, thread-safe via sync.Once)
+		s.initAlternates()
+
+		// Return error if alternates initialization failed
+		if s.alternatesErr != nil {
+			return nil, err
 		}
+
+		// Search in cached alternates (no recreation - performance optimization!)
+		for _, alt := range s.alternates {
+			obj, err = alt.EncodedObject(t, h)
+			if err == nil {
+				return obj, nil
+			}
+			// Continue to next alternate if not found
+		}
+
+		// If still not found in any alternate, return original error
+		err = plumbing.ErrObjectNotFound
 	}
 
 	if err != nil {
