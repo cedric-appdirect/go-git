@@ -12,6 +12,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	stdsync "sync"
 	"time"
 
 	"github.com/go-git/go-billy/v6"
@@ -19,11 +20,13 @@ import (
 	"github.com/go-git/go-git/v6/config"
 	giturl "github.com/go-git/go-git/v6/internal/url"
 	"github.com/go-git/go-git/v6/plumbing"
+	"github.com/go-git/go-git/v6/plumbing/cache"
 	"github.com/go-git/go-git/v6/plumbing/filemode"
 	"github.com/go-git/go-git/v6/plumbing/format/gitignore"
 	"github.com/go-git/go-git/v6/plumbing/format/index"
 	"github.com/go-git/go-git/v6/plumbing/object"
 	"github.com/go-git/go-git/v6/plumbing/storer"
+	"github.com/go-git/go-git/v6/storage/filesystem"
 	"github.com/go-git/go-git/v6/utils/convert"
 	"github.com/go-git/go-git/v6/utils/ioutil"
 	"github.com/go-git/go-git/v6/utils/merkletrie"
@@ -491,11 +494,7 @@ func (w *Worktree) resetWorktree(t *object.Tree, files []string) error {
 	}
 	b := newIndexBuilder(idx)
 
-	// Create a cache for tree entries that will be populated lazily
-	// as we process changes. This avoids upfront tree traversal costs
-	// and only caches entries we actually need.
-	entryCache := make(map[string]*object.TreeEntry)
-
+	var validChanges []merkletrie.Change
 	for _, ch := range changes {
 		if err := w.validChange(ch); err != nil {
 			return err
@@ -519,13 +518,94 @@ func (w *Worktree) resetWorktree(t *object.Tree, files []string) error {
 			}
 		}
 
-		if err := w.checkoutChange(ch, t, b, entryCache); err != nil {
-			return err
+		validChanges = append(validChanges, ch)
+	}
+
+	numWorkers := runtime.GOMAXPROCS(0)
+	if numWorkers < 1 {
+		numWorkers = 1
+	}
+
+	workCh := make(chan merkletrie.Change, len(validChanges))
+	type result struct {
+		idx int
+		err error
+	}
+	resultCh := make(chan result, len(validChanges))
+	var wg stdsync.WaitGroup
+
+	workerTrees, err := w.createWorkerTrees(t, numWorkers)
+	if err != nil {
+		return err
+	}
+
+	for i := 0; i < numWorkers; i++ {
+		wg.Add(1)
+		workerTree := workerTrees[i]
+		go func() {
+			entryCache := make(map[string]*object.TreeEntry)
+
+			defer wg.Done()
+			for ch := range workCh {
+				err := w.checkoutChange(ch, workerTree, b, entryCache)
+
+				if err != nil {
+					resultCh <- result{err: err}
+					return
+				}
+			}
+		}()
+	}
+
+	for _, ch := range validChanges {
+		workCh <- ch
+	}
+	close(workCh)
+
+	wg.Wait()
+	close(resultCh)
+
+	for res := range resultCh {
+		if res.err != nil {
+			return res.err
 		}
 	}
 
 	b.Write(idx)
 	return w.r.Storer.SetIndex(idx)
+}
+
+// createWorkerTrees creates per-worker trees, each with its own object reader.
+// This allows parallel object fetching without contention on packfile readers.
+func (w *Worktree) createWorkerTrees(t *object.Tree, numWorkers int) ([]*object.Tree, error) {
+	// Try to create per-worker object storers for filesystem storage
+	if fsStorage, ok := w.r.Storer.(*filesystem.Storage); ok {
+		trees := make([]*object.Tree, numWorkers)
+
+		for i := 0; i < numWorkers; i++ {
+			workerStorage := filesystem.NewStorage(
+				fsStorage.Filesystem(),
+				cache.NewObjectLRUDefault(),
+			)
+
+			workerTree, err := object.GetTree(workerStorage, t.Hash)
+			if err != nil {
+				return nil, err
+			}
+
+			trees[i] = workerTree
+		}
+
+		return trees, nil
+	}
+
+	// Fallback: if not filesystem storage, reuse the same tree
+	// (this won't benefit from parallelization but won't break)
+	trees := make([]*object.Tree, numWorkers)
+	for i := range trees {
+		trees[i] = t
+	}
+	return trees, nil
 }
 
 // worktreeDeny is a list of paths that are not allowed
@@ -1296,6 +1376,7 @@ func removeDirIfEmpty(fs billy.Filesystem, dir string) (bool, error) {
 
 type indexBuilder struct {
 	entries map[string]*index.Entry
+	mu      stdsync.Mutex
 }
 
 func newIndexBuilder(idx *index.Index) *indexBuilder {
@@ -1316,9 +1397,13 @@ func (b *indexBuilder) Write(idx *index.Index) {
 }
 
 func (b *indexBuilder) Add(e *index.Entry) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
 	b.entries[e.Name] = e
 }
 
 func (b *indexBuilder) Remove(name string) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
 	delete(b.entries, filepath.ToSlash(name))
 }
