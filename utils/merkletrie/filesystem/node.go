@@ -4,10 +4,12 @@ import (
 	"io"
 	"os"
 	"path"
+	"time"
 
 	"github.com/go-git/go-git/v6/plumbing"
 	"github.com/go-git/go-git/v6/plumbing/filemode"
 	format "github.com/go-git/go-git/v6/plumbing/format/config"
+	"github.com/go-git/go-git/v6/plumbing/format/index"
 	"github.com/go-git/go-git/v6/utils/convert"
 	"github.com/go-git/go-git/v6/utils/ioutil"
 	"github.com/go-git/go-git/v6/utils/merkletrie/noder"
@@ -33,6 +35,8 @@ type Options struct {
 type node struct {
 	fs         billy.Filesystem
 	submodules map[string]plumbing.Hash
+	idx        *index.Index           // for metadata comparison optimization
+	idxMap     map[string]*index.Entry // cached index entries for O(1) lookup
 
 	options *Options
 
@@ -42,6 +46,7 @@ type node struct {
 	isDir    bool
 	mode     os.FileMode
 	size     int64
+	modTime  time.Time // cached from ReadDir to avoid extra Lstat
 }
 
 // NewRootNode returns the root node based on a given billy.Filesystem.
@@ -64,6 +69,35 @@ func NewRootNodeWithOptions(
 	return &node{
 		fs:         fs,
 		submodules: submodules,
+		options:    &options,
+		isDir:      true,
+	}
+}
+
+// NewRootNodeWithIndex returns the root node based on a given billy.Filesystem
+// and an index. This enables the metadata-first comparison optimization where
+// we check file metadata (mtime, size, mode) against the index before hashing.
+//
+// This dramatically improves Status() performance by avoiding unnecessary file
+// I/O when files haven't changed.
+func NewRootNodeWithIndex(
+	fs billy.Filesystem,
+	submodules map[string]plumbing.Hash,
+	idx *index.Index,
+	options Options,
+) noder.Noder {
+	// Build a map of index entries for O(1) lookup
+	// This avoids the O(n) linear search in Index.Entry()
+	idxMap := make(map[string]*index.Entry, len(idx.Entries))
+	for _, entry := range idx.Entries {
+		idxMap[entry.Name] = entry
+	}
+
+	return &node{
+		fs:         fs,
+		submodules: submodules,
+		idx:        idx,
+		idxMap:     idxMap,
 		options:    &options,
 		isDir:      true,
 	}
@@ -161,12 +195,15 @@ func (n *node) newChildNode(file os.FileInfo) (*node, error) {
 	node := &node{
 		fs:         n.fs,
 		submodules: n.submodules,
+		idx:        n.idx,
+		idxMap:     n.idxMap,
 		options:    n.options,
 
-		path:  path,
-		isDir: file.IsDir(),
-		size:  file.Size(),
-		mode:  file.Mode(),
+		path:    path,
+		isDir:   file.IsDir(),
+		size:    file.Size(),
+		mode:    file.Mode(),
+		modTime: file.ModTime(), // Cache modtime from ReadDir
 	}
 
 	if _, isSubmodule := n.submodules[path]; isSubmodule {
@@ -190,6 +227,20 @@ func (n *node) calculateHash() {
 		n.hash = append(submoduleHash.Bytes(), filemode.Submodule.Bytes()...)
 		return
 	}
+
+	// Optimization: Check metadata before hashing.
+	// If the file's metadata (mtime, size, mode) matches the index entry,
+	// we can reuse the hash from the index instead of reading and hashing
+	// the file content. This is the same optimization that native git uses
+	// (ie_match_stat in read-cache.c) and dramatically improves Status()
+	// performance by avoiding file I/O for unchanged files.
+	if entry := n.getIndexEntry(); entry != nil && n.metadataMatches(entry) {
+		// Metadata matches - reuse hash from index
+		n.hash = append(entry.Hash.Bytes(), mode.Bytes()...)
+		return
+	}
+
+	// Metadata differs or no index entry - hash the file
 	var hash plumbing.Hash
 	if n.mode&os.ModeSymlink != 0 {
 		hash = n.doCalculateHashForSymlink()
@@ -197,6 +248,45 @@ func (n *node) calculateHash() {
 		hash = n.doCalculateHashForRegular()
 	}
 	n.hash = append(hash.Bytes(), mode.Bytes()...)
+}
+
+// getIndexEntry retrieves the index entry for this file, if available.
+// Uses the O(1) map lookup instead of O(n) linear search.
+func (n *node) getIndexEntry() *index.Entry {
+	if n.idxMap == nil {
+		return nil
+	}
+	return n.idxMap[n.path]
+}
+
+// metadataMatches checks if the file's metadata matches the given index entry.
+// This implements the same optimization as git's ie_match_stat() function.
+// Returns true if the file appears unchanged based on metadata, false otherwise.
+func (n *node) metadataMatches(entry *index.Entry) bool {
+	// Size check (fastest check, catches most changes)
+	if uint32(n.size) != entry.Size {
+		return false
+	}
+
+	// Modification time check
+	// Use the cached modTime from ReadDir - no extra Lstat needed!
+	// Use Equal() to handle sub-second precision correctly across platforms
+	if !n.modTime.IsZero() && !n.modTime.Equal(entry.ModifiedAt) {
+		return false
+	}
+
+	// Mode check
+	mode, err := filemode.NewFromOSFileMode(n.mode)
+	if err != nil {
+		return false
+	}
+
+	// Compare modes - for executable files, check if the index also has executable
+	if mode != entry.Mode {
+		return false
+	}
+
+	return true
 }
 
 func (n *node) doCalculateHashForRegular() plumbing.Hash {
