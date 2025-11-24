@@ -743,7 +743,7 @@ func (w *Worktree) checkoutChange(ch merkletrie.Change, t *object.Tree, idx *ind
 		return w.checkoutChangeSubmodule(name, a, e, idx)
 	}
 
-	return w.checkoutChangeRegularFile(name, a, e, idx)
+	return w.checkoutChangeRegularFile(name, a, t, e, idx)
 }
 
 func (w *Worktree) containsUnstagedChanges() (bool, error) {
@@ -827,6 +827,7 @@ func (w *Worktree) checkoutChangeSubmodule(name string,
 
 func (w *Worktree) checkoutChangeRegularFile(name string,
 	a merkletrie.Action,
+	t *object.Tree,
 	e *object.TreeEntry,
 	idx *indexBuilder,
 ) error {
@@ -842,12 +843,12 @@ func (w *Worktree) checkoutChangeRegularFile(name string,
 
 		fallthrough
 	case merkletrie.Insert:
-		// Get blob directly from the TreeEntry to avoid duplicate FindEntry call
-		blob, err := object.GetBlob(w.r.Storer, e.Hash)
+		// Get file from TreeEntry using the Tree's storer to avoid contention in parallel checkout.
+		// Each worker has its own Tree with a separate storer instance.
+		f, err := t.FileFromEntry(name, e)
 		if err != nil {
 			return err
 		}
-		f := object.NewFile(name, e.Mode, blob)
 
 		if err := w.checkoutFile(f); err != nil {
 			return err
