@@ -743,7 +743,7 @@ func (w *Worktree) checkoutChange(ch merkletrie.Change, t *object.Tree, idx *ind
 		return w.checkoutChangeSubmodule(name, a, e, idx)
 	}
 
-	return w.checkoutChangeRegularFile(name, a, t, e, idx)
+	return w.checkoutChangeRegularFile(name, a, e, idx)
 }
 
 func (w *Worktree) containsUnstagedChanges() (bool, error) {
@@ -827,7 +827,6 @@ func (w *Worktree) checkoutChangeSubmodule(name string,
 
 func (w *Worktree) checkoutChangeRegularFile(name string,
 	a merkletrie.Action,
-	t *object.Tree,
 	e *object.TreeEntry,
 	idx *indexBuilder,
 ) error {
@@ -843,10 +842,12 @@ func (w *Worktree) checkoutChangeRegularFile(name string,
 
 		fallthrough
 	case merkletrie.Insert:
-		f, err := t.File(name)
+		// Get blob directly from the TreeEntry to avoid duplicate FindEntry call
+		blob, err := object.GetBlob(w.r.Storer, e.Hash)
 		if err != nil {
 			return err
 		}
+		f := object.NewFile(name, e.Mode, blob)
 
 		if err := w.checkoutFile(f); err != nil {
 			return err
