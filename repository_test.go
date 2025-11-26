@@ -933,7 +933,9 @@ func (s *RepositorySuite) TestPlainCloneBareAndShared() {
 	data, err := os.ReadFile(altpath)
 	s.NoError(err)
 
-	line := path.Join(remote, GitDirName, "objects") + "\n"
+	// The test fixture path points directly to the git directory content,
+	// so alternates should point to remote/objects (not remote/.git/objects)
+	line := path.Join(remote, "objects") + "\n"
 	s.Equal(line, string(data))
 
 	cfg, err := r.Config()
@@ -959,7 +961,9 @@ func (s *RepositorySuite) TestPlainCloneShared() {
 	data, err := os.ReadFile(altpath)
 	s.NoError(err)
 
-	line := path.Join(remote, GitDirName, "objects") + "\n"
+	// The test fixture path points directly to the git directory content,
+	// so alternates should point to remote/objects (not remote/.git/objects)
+	line := path.Join(remote, "objects") + "\n"
 	s.Equal(line, string(data))
 
 	cfg, err := r.Config()
@@ -999,6 +1003,317 @@ func (s *RepositorySuite) TestPlainCloneSharedSSHShouldReturnError() {
 		Shared: true,
 	})
 	s.ErrorIs(err, ErrAlternatePathNotSupported)
+}
+
+func (s *RepositorySuite) TestPlainCloneSharedNoCheckout() {
+	dir := s.T().TempDir()
+	remote := s.GetBasicLocalRepositoryURL()
+
+	r, err := PlainClone(dir, &CloneOptions{
+		URL:        remote,
+		Shared:     true,
+		NoCheckout: true,
+	})
+	s.NoError(err)
+
+	// Verify alternates file is set up correctly
+	altpath := path.Join(dir, GitDirName, "objects", "info", "alternates")
+	_, err = os.Stat(altpath)
+	s.NoError(err)
+
+	data, err := os.ReadFile(altpath)
+	s.NoError(err)
+
+	// The test fixture path points directly to the git directory content,
+	// so alternates should point to remote/objects (not remote/.git/objects)
+	line := path.Join(remote, "objects") + "\n"
+	s.Equal(line, string(data))
+
+	// Verify branches config
+	cfg, err := r.Config()
+	s.NoError(err)
+	s.Len(cfg.Branches, 1)
+	s.Equal("master", cfg.Branches["master"].Name)
+
+	// Verify HEAD is set
+	head, err := r.Head()
+	s.NoError(err)
+	s.NotNil(head)
+
+	// Verify we can access objects through alternates
+	commit, err := r.CommitObject(head.Hash())
+	s.NoError(err)
+	s.NotNil(commit)
+}
+
+func (s *RepositorySuite) TestPlainCloneSharedNoCheckoutBare() {
+	dir := s.T().TempDir()
+	remote := s.GetBasicLocalRepositoryURL()
+
+	r, err := PlainClone(dir, &CloneOptions{
+		URL:        remote,
+		Shared:     true,
+		NoCheckout: true,
+		Bare:       true,
+	})
+	s.NoError(err)
+
+	// Verify alternates file is set up correctly
+	altpath := path.Join(dir, "objects", "info", "alternates")
+	_, err = os.Stat(altpath)
+	s.NoError(err)
+
+	// Verify HEAD is set
+	head, err := r.Head()
+	s.NoError(err)
+	s.NotNil(head)
+
+	// Verify we can access objects through alternates
+	commit, err := r.CommitObject(head.Hash())
+	s.NoError(err)
+	s.NotNil(commit)
+}
+
+func (s *RepositorySuite) TestPlainCloneSharedLocal() {
+	dir := s.T().TempDir()
+	remote := s.GetBasicLocalRepositoryURL()
+
+	r, err := PlainClone(dir, &CloneOptions{
+		URL:        remote,
+		Shared:     true,
+		NoCheckout: true,
+	})
+	s.NoError(err)
+
+	// Verify alternates file is set up correctly
+	altpath := path.Join(dir, GitDirName, "objects", "info", "alternates")
+	_, err = os.Stat(altpath)
+	s.NoError(err)
+
+	// Verify branches config
+	cfg, err := r.Config()
+	s.NoError(err)
+	s.Len(cfg.Branches, 1)
+	s.Equal("master", cfg.Branches["master"].Name)
+
+	// Verify HEAD is set
+	head, err := r.Head()
+	s.NoError(err)
+	s.NotNil(head)
+
+	// Verify we can access objects through alternates
+	commit, err := r.CommitObject(head.Hash())
+	s.NoError(err)
+	s.NotNil(commit)
+}
+
+func (s *RepositorySuite) TestPlainCloneSharedLocalBare() {
+	dir := s.T().TempDir()
+	remote := s.GetBasicLocalRepositoryURL()
+
+	r, err := PlainClone(dir, &CloneOptions{
+		URL:        remote,
+		Shared:     true,
+		NoCheckout: true,
+		Bare:       true,
+	})
+	s.NoError(err)
+
+	// Verify alternates file is set up correctly
+	altpath := path.Join(dir, "objects", "info", "alternates")
+	_, err = os.Stat(altpath)
+	s.NoError(err)
+
+	// Verify HEAD is set
+	head, err := r.Head()
+	s.NoError(err)
+	s.NotNil(head)
+
+	// Verify we can access objects through alternates
+	commit, err := r.CommitObject(head.Hash())
+	s.NoError(err)
+	s.NotNil(commit)
+
+	// Verify all tags are available
+	tags, err := r.Tags()
+	s.NoError(err)
+	var tagCount int
+	err = tags.ForEach(func(ref *plumbing.Reference) error {
+		tagCount++
+		return nil
+	})
+	s.NoError(err)
+	s.Greater(tagCount, 0)
+}
+
+func (s *RepositorySuite) TestPlainCloneSharedLocalViaSymlink() {
+	// This test reproduces an issue on macOS where /var is a symlink to /private/var.
+	// When the alternates file contains a path through a symlink, and the repository
+	// is accessed from the resolved (real) path, path resolution can fail because
+	// the ChrootHelper tries to make the symlinked path relative to the real path.
+	//
+	// Example on macOS:
+	//   - Source repo at /var/folders/.../source (symlink path)
+	//   - Real path is /private/var/folders/.../source
+	//   - Alternates file contains /var/folders/.../source/.git/objects
+	//   - Chroot is rooted at /private/var/folders/.../dest/.git
+	//   - filepath.Rel("/private/var/...", "/var/...") fails - different prefixes
+
+	// Create the real directory
+	realDir := s.T().TempDir()
+
+	// Create a symlink in a different temp dir pointing to realDir
+	linkParent := s.T().TempDir()
+	symlinkPath := filepath.Join(linkParent, "link")
+	err := os.Symlink(realDir, symlinkPath)
+	s.NoError(err)
+
+	// Create source repo at the real path
+	srcRealPath := filepath.Join(realDir, "source")
+	err = os.MkdirAll(srcRealPath, 0755)
+	s.NoError(err)
+
+	src, err := PlainInit(srcRealPath, false)
+	s.NoError(err)
+
+	wt, err := src.Worktree()
+	s.NoError(err)
+
+	// Create a file and commit
+	testFile := filepath.Join(srcRealPath, "test.txt")
+	err = os.WriteFile(testFile, []byte("test content"), 0644)
+	s.NoError(err)
+
+	_, err = wt.Add("test.txt")
+	s.NoError(err)
+
+	_, err = wt.Commit("initial commit", &CommitOptions{
+		Author: &object.Signature{
+			Name:  "Test",
+			Email: "test@test.com",
+			When:  time.Now(),
+		},
+	})
+	s.NoError(err)
+
+	// Clone using the SYMLINK path as URL, to a destination at the real path
+	// This means:
+	// - alternates file will contain the symlink path
+	// - but the repo's filesystem is rooted at the real path
+	srcViaSymlink := filepath.Join(symlinkPath, "source")
+	dstPath := filepath.Join(realDir, "dest")
+
+	r, err := PlainClone(dstPath, &CloneOptions{
+		URL:        srcViaSymlink, // Using symlink path - this goes into alternates
+		Shared:     true,
+		NoCheckout: true,
+	})
+	s.NoError(err)
+
+	// Verify alternates file contains the symlink path
+	altPath := filepath.Join(dstPath, ".git", "objects", "info", "alternates")
+	altContent, err := os.ReadFile(altPath)
+	s.NoError(err)
+	s.Contains(string(altContent), "link/source")
+
+	// This should work - access objects through alternates
+	// Without the fix, this fails because the chrooted filesystem can't resolve
+	// the symlinked path relative to the real path
+	head, err := r.Head()
+	s.NoError(err)
+
+	commit, err := r.CommitObject(head.Hash())
+	s.NoError(err)
+	s.NotNil(commit)
+}
+
+func (s *RepositorySuite) TestPlainCloneSharedLocalNestedAlternates() {
+	// This test reproduces an issue where nested alternates fail because
+	// AlternatesFS is not propagated to alternate DotGit objects.
+	//
+	// On macOS with /var -> /private/var symlink, when:
+	// 1. Main repo has AlternatesFS set
+	// 2. Alternates() creates DotGit for alternate without AlternatesFS
+	// 3. When that alternate DotGit accesses files, it uses chrooted fs
+	// 4. The chrooted fs can't resolve symlinked absolute paths
+
+	// Create the real directory structure
+	realDir := s.T().TempDir()
+
+	// Create a symlink to simulate macOS /var -> /private/var
+	linkParent := s.T().TempDir()
+	symlinkPath := filepath.Join(linkParent, "link")
+	err := os.Symlink(realDir, symlinkPath)
+	s.NoError(err)
+
+	// Create repo A (original source) at the symlink path
+	repoAPath := filepath.Join(symlinkPath, "repoA")
+	err = os.MkdirAll(repoAPath, 0755)
+	s.NoError(err)
+
+	repoA, err := PlainInit(repoAPath, false)
+	s.NoError(err)
+
+	wtA, err := repoA.Worktree()
+	s.NoError(err)
+
+	testFileA := filepath.Join(repoAPath, "a.txt")
+	err = os.WriteFile(testFileA, []byte("content A"), 0644)
+	s.NoError(err)
+
+	_, err = wtA.Add("a.txt")
+	s.NoError(err)
+
+	_, err = wtA.Commit("commit A", &CommitOptions{
+		Author: &object.Signature{Name: "Test", Email: "test@test.com", When: time.Now()},
+	})
+	s.NoError(err)
+
+	// Create repo B as a shared clone of A (via symlink path)
+	// B's alternates points to A (symlink path)
+	repoBPath := filepath.Join(symlinkPath, "repoB")
+	repoB, err := PlainClone(repoBPath, &CloneOptions{
+		URL:        repoAPath, // symlink path
+		Shared:     true,
+		NoCheckout: true,
+	})
+	s.NoError(err)
+
+	// Verify B works
+	headB, err := repoB.Head()
+	s.NoError(err)
+	s.NotNil(headB)
+
+	// Create repo C as a shared clone of B, but at the REAL path
+	// C's alternates points to B (symlink path)
+	// C's filesystem is rooted at real path
+	repoCPath := filepath.Join(realDir, "repoC") // Using real path, not symlink
+	repoC, err := PlainClone(repoCPath, &CloneOptions{
+		URL:        repoBPath, // symlink path
+		Shared:     true,
+		NoCheckout: true,
+	})
+	s.NoError(err)
+
+	// When C accesses objects:
+	// 1. C's storage looks in C's objects (empty)
+	// 2. C's storage looks in C's alternates -> B (via symlink path)
+	// 3. B's DotGit is created without AlternatesFS
+	// 4. B's storage looks in B's objects (empty)
+	// 5. B's storage looks in B's alternates -> A (via symlink path)
+	// 6. When B tries to read alternates file or access A's objects,
+	//    B's chrooted fs (rooted at real path) fails to resolve symlink path
+
+	// This should work but fails on macOS without the fix
+	headC, err := repoC.Head()
+	s.NoError(err)
+
+	commit, err := repoC.CommitObject(headC.Hash())
+	s.NoError(err)
+	s.NotNil(commit)
+
+	// Verify commit has the right message (from repo A)
+	s.Equal("commit A", commit.Message)
 }
 
 func (s *RepositorySuite) TestPlainCloneWithRemoteName() {

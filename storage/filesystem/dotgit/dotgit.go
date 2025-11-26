@@ -1227,7 +1227,13 @@ func (d *DotGit) Alternates() ([]*DotGit, error) {
 		if err != nil {
 			return nil, fmt.Errorf("cannot chroot %q: %w", path, err)
 		}
-		alternates = append(alternates, New(afs))
+		// Propagate AlternatesFS to the alternate DotGit so that nested
+		// alternates can be resolved correctly. This is important when
+		// alternates paths contain symlinks (e.g., macOS /var -> /private/var)
+		// because the chrooted fs cannot resolve paths through symlinks.
+		alternates = append(alternates, NewWithOptions(afs, Options{
+			AlternatesFS: d.options.AlternatesFS,
+		}))
 	}
 
 	if err = scanner.Err(); err != nil {

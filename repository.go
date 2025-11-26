@@ -77,6 +77,7 @@ type initOptions struct {
 	defaultBranch plumbing.ReferenceName
 	workTree      billy.Filesystem
 	objectFormat  formatcfg.ObjectFormat
+	alternatesFS  billy.Filesystem
 }
 
 func newInitOptions() initOptions {
@@ -84,6 +85,7 @@ func newInitOptions() initOptions {
 		defaultBranch: plumbing.Master,
 		workTree:      nil,
 		objectFormat:  formatcfg.SHA1,
+		alternatesFS:  nil,
 	}
 }
 
@@ -108,6 +110,15 @@ func WithWorkTree(worktree billy.Filesystem) InitOption {
 func WithObjectFormat(of formatcfg.ObjectFormat) InitOption {
 	return func(o *initOptions) {
 		o.objectFormat = of
+	}
+}
+
+// WithAlternatesFS sets the filesystem to use for resolving Git alternates.
+// This is needed when cloning with Shared option to access objects from
+// the source repository.
+func WithAlternatesFS(fs billy.Filesystem) InitOption {
+	return func(o *initOptions) {
+		o.alternatesFS = fs
 	}
 }
 
@@ -312,6 +323,7 @@ func PlainInit(path string, isBare bool, options ...InitOption) (*Repository, er
 	}
 	s := filesystem.NewStorageWithOptions(dot, cache.NewObjectLRUDefault(), filesystem.Options{
 		ObjectFormat: o.objectFormat,
+		AlternatesFS: o.alternatesFS,
 	})
 	r, err := initFn(s)
 	if err != nil {
@@ -526,7 +538,17 @@ func PlainCloneContext(ctx context.Context, path string, o *CloneOptions) (*Repo
 	if o.Mirror {
 		isBare = true
 	}
-	r, err := PlainInit(path, isBare)
+
+	// When using Shared option with a local repository, we need to provide
+	// AlternatesFS so that the storage can access objects from the source
+	// repository's objects directory. The alternates file contains absolute
+	// paths, so we need a filesystem rooted at / to resolve them.
+	var initOpts []InitOption
+	if o.Shared && url.IsLocalEndpoint(o.URL) {
+		initOpts = append(initOpts, WithAlternatesFS(osfs.New("/", osfs.WithBoundOS())))
+	}
+
+	r, err := PlainInit(path, isBare, initOpts...)
 	if err != nil {
 		return nil, err
 	}
@@ -923,12 +945,14 @@ func (r *Repository) clone(ctx context.Context, o *CloneOptions) error {
 	// When the repository to clone is on the local machine,
 	// instead of using hard links, automatically setup .git/objects/info/alternates
 	// to share the objects with the source repository
+	var remoteRepo *Repository
 	if o.Shared {
 		if !url.IsLocalEndpoint(o.URL) {
 			return ErrAlternatePathNotSupported
 		}
 		altpath := o.URL
-		remoteRepo, err := PlainOpen(o.URL)
+		var err error
+		remoteRepo, err = PlainOpen(o.URL)
 		if err != nil {
 			return fmt.Errorf("failed to open remote repository: %w", err)
 		}
@@ -936,7 +960,14 @@ func (r *Repository) clone(ctx context.Context, o *CloneOptions) error {
 		if err != nil {
 			return fmt.Errorf("failed to read remote repository configuration: %w", err)
 		}
-		if !conf.Core.IsBare {
+		// Check if the URL already points to a git directory by looking for the objects dir.
+		// This handles cases where:
+		// 1. The config says IsBare=false but the URL points to a .git directory
+		// 2. The URL ends with .git but is a bare repo
+		// We check for the presence of the objects directory to determine the correct path.
+		_, statErr := os.Stat(path.Join(o.URL, "objects"))
+		urlIsGitDir := statErr == nil
+		if !conf.Core.IsBare && !urlIsGitDir {
 			altpath = path.Join(altpath, GitDirName)
 		}
 		if err := r.Storer.AddAlternate(altpath); err != nil {
@@ -944,20 +975,32 @@ func (r *Repository) clone(ctx context.Context, o *CloneOptions) error {
 		}
 	}
 
-	ref, err := r.fetchAndUpdateReferences(ctx, &FetchOptions{
-		RefSpecs:        c.Fetch,
-		Depth:           o.Depth,
-		Auth:            o.Auth,
-		Progress:        o.Progress,
-		Tags:            o.Tags,
-		RemoteName:      o.RemoteName,
-		InsecureSkipTLS: o.InsecureSkipTLS,
-		CABundle:        o.CABundle,
-		ProxyOptions:    o.ProxyOptions,
-		Filter:          o.Filter,
-	}, o.ReferenceName)
-	if err != nil {
-		return err
+	var ref *plumbing.Reference
+	var err error
+
+	// When Shared is true and we have a local source repository, skip the
+	// UploadPack fetch and copy references directly from the source repository
+	if o.Shared && remoteRepo != nil {
+		ref, err = r.copyReferencesFromLocal(remoteRepo, c.Fetch, o)
+		if err != nil {
+			return err
+		}
+	} else {
+		ref, err = r.fetchAndUpdateReferences(ctx, &FetchOptions{
+			RefSpecs:        c.Fetch,
+			Depth:           o.Depth,
+			Auth:            o.Auth,
+			Progress:        o.Progress,
+			Tags:            o.Tags,
+			RemoteName:      o.RemoteName,
+			InsecureSkipTLS: o.InsecureSkipTLS,
+			CABundle:        o.CABundle,
+			ProxyOptions:    o.ProxyOptions,
+			Filter:          o.Filter,
+		}, o.ReferenceName)
+		if err != nil {
+			return err
+		}
 	}
 
 	if r.wt != nil && !o.NoCheckout {
@@ -1048,6 +1091,76 @@ func (r *Repository) cloneRefSpec(o *CloneOptions) []config.RefSpec {
 			config.RefSpec(fmt.Sprintf(config.DefaultFetchRefSpec, o.RemoteName)),
 		}
 	}
+}
+
+// copyReferencesFromLocal copies references from a local repository directly,
+// bypassing the UploadPack protocol. This is used when SkipFetch is true with
+// Shared option to avoid the overhead of the git transport protocol.
+func (r *Repository) copyReferencesFromLocal(
+	source *Repository, specs []config.RefSpec, o *CloneOptions,
+) (*plumbing.Reference, error) {
+	var resolvedRef *plumbing.Reference
+
+	if o.ReferenceName == plumbing.HEAD {
+		headRef, err := source.Head()
+		if err != nil {
+			return nil, fmt.Errorf("failed to resolve HEAD from source: %w", err)
+		}
+		resolvedRef = headRef
+	} else {
+		ref, err := source.Reference(o.ReferenceName, true)
+		if err != nil {
+			return nil, fmt.Errorf("failed to resolve reference %s from source: %w", o.ReferenceName, err)
+		}
+		resolvedRef = ref
+	}
+
+	sourceRefs, err := source.References()
+	if err != nil {
+		return nil, fmt.Errorf("failed to get references from source: %w", err)
+	}
+
+	err = sourceRefs.ForEach(func(ref *plumbing.Reference) error {
+		if ref.Type() != plumbing.HashReference && ref.Type() != plumbing.SymbolicReference {
+			return nil
+		}
+
+		actualRef := ref
+		if ref.Type() == plumbing.SymbolicReference {
+			resolved, err := storer.ResolveReference(source.Storer, ref.Name())
+			if err != nil {
+				return nil
+			}
+			actualRef = plumbing.NewHashReference(ref.Name(), resolved.Hash())
+		}
+
+		for _, spec := range specs {
+			if spec.Match(actualRef.Name()) {
+				dstName := spec.Dst(actualRef.Name())
+				newRef := plumbing.NewHashReference(dstName, actualRef.Hash())
+				if err := r.Storer.SetReference(newRef); err != nil {
+					return err
+				}
+			}
+		}
+
+		if o.Tags == plumbing.AllTags && actualRef.Name().IsTag() {
+			if err := r.Storer.SetReference(actualRef); err != nil {
+				return err
+			}
+		}
+
+		return nil
+	})
+	if err != nil {
+		return nil, fmt.Errorf("failed to copy references: %w", err)
+	}
+
+	if _, err := r.updateReferences(specs, resolvedRef); err != nil {
+		return nil, err
+	}
+
+	return resolvedRef, nil
 }
 
 func (r *Repository) setIsBare(isBare bool) error {

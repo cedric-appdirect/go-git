@@ -30,7 +30,9 @@ const (
 	DefaultSubmoduleRecursionDepth SubmoduleRecursivity = 10
 )
 
-var ErrMissingURL = errors.New("URL field is required")
+var (
+	ErrMissingURL = errors.New("URL field is required")
+)
 
 // CloneOptions describes how a clone should be performed.
 type CloneOptions struct {
@@ -82,6 +84,10 @@ type CloneOptions struct {
 	// The resulting repository starts out without any object of its own.
 	// NOTE: this is a possibly dangerous operation; do not use it unless
 	// you understand what it does.
+	//
+	// When Shared is true for local repositories, the clone operation skips
+	// the UploadPack protocol entirely and copies references directly from
+	// the source repository. Objects are accessed through git alternates.
 	//
 	// [Reference]: https://git-scm.com/docs/git-clone#Documentation/git-clone.txt---shared
 	Shared bool
