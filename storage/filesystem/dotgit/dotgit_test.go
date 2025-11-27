@@ -904,7 +904,8 @@ func testAlternates(t *testing.T, dotFS, altFS billy.Filesystem) {
 }
 
 func TestAlternatesDupes(t *testing.T) {
-	dotFS := osfs.New(t.TempDir())
+	// Use WithBoundOS so the filesystem can access absolute paths in alternates
+	dotFS := osfs.New(t.TempDir(), osfs.WithBoundOS())
 	dir := New(dotFS)
 	err := dir.Initialize()
 	assert.NoError(t, err)
@@ -933,17 +934,13 @@ func TestAlternatesDupes(t *testing.T) {
 }
 
 func TestAlternatesSymlinkWithChroot(t *testing.T) {
-	// This test reproduces an issue where alternates fail when:
+	// This test verifies behavior when alternates contain absolute paths:
 	// 1. The filesystem is a ChrootHelper
 	// 2. The alternates file contains a path outside the chroot (via symlink or different location)
 	// 3. The ChrootHelper cannot access paths outside its root
 	//
-	// This happens on macOS where /var -> /private/var, and when cloning:
-	//   - Source repo at /var/folders/.../source (symlink path)
-	//   - Dest repo at /private/var/folders/.../dest (resolved path)
-	//   - Alternates file contains /var/folders/.../source/.git/objects
-	//   - Dest's chroot root is /private/var/folders/.../dest/.git
-	//   - ChrootHelper can't access /var/... because it's outside its root
+	// When AlternatesFS is NOT configured, an error should be returned.
+	// When AlternatesFS IS configured, alternates should be resolved correctly.
 
 	// Create real directory
 	realDir := t.TempDir()
@@ -977,20 +974,18 @@ func TestAlternatesSymlinkWithChroot(t *testing.T) {
 	destFS, err := baseFS.Chroot(filepath.Join("dest", ".git"))
 	assert.NoError(t, err)
 
-	// Create DotGit without AlternatesFS - this should now succeed
-	// because the Alternates() method automatically uses osfs.New("/")
-	// for absolute paths when AlternatesFS is not explicitly set.
-	// This is the fix for macOS where /var -> /private/var symlinks
-	// would cause failures when the chroot couldn't access paths outside its root.
+	// Create DotGit without AlternatesFS - this should return an error
+	// because the alternates file contains an absolute path and AlternatesFS
+	// is not configured.
 	dir := New(destFS)
-	dotgits, err := dir.Alternates()
-	assert.NoError(t, err, "should succeed even without AlternatesFS because absolute paths are auto-resolved with osfs.New(\"/\")")
-	assert.Len(t, dotgits, 1)
+	_, err = dir.Alternates()
+	assert.Error(t, err, "should fail without AlternatesFS when alternates contains absolute path")
+	assert.Contains(t, err.Error(), "AlternatesFS is not configured")
 
-	// Also verify it works with explicit AlternatesFS rooted at /
+	// With explicit AlternatesFS rooted at /, it should succeed
 	rootFS := osfs.New("/", osfs.WithBoundOS())
 	dirWithAltFS := NewWithOptions(destFS, Options{AlternatesFS: rootFS})
-	dotgits, err = dirWithAltFS.Alternates()
+	dotgits, err := dirWithAltFS.Alternates()
 	assert.NoError(t, err, "should succeed with AlternatesFS rooted at /")
 	assert.Len(t, dotgits, 1)
 }

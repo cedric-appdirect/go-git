@@ -22,7 +22,6 @@ import (
 
 	"github.com/go-git/go-billy/v6"
 	"github.com/go-git/go-billy/v6/helper/chroot"
-	"github.com/go-git/go-billy/v6/osfs"
 )
 
 const (
@@ -1201,12 +1200,14 @@ func (d *DotGit) Alternates() ([]*DotGit, error) {
 		fs := d.options.AlternatesFS
 		if fs == nil {
 			if filepath.IsAbs(path) {
-				// For absolute paths without an explicit AlternatesFS,
-				// use the OS filesystem rooted at / to access them.
-				fs = osfs.New("/", osfs.WithBoundOS())
-			} else {
-				fs = d.fs
+				// Check if d.fs can handle absolute paths. ChrootHelper cannot
+				// access paths outside its root, so we require AlternatesFS.
+				// Other filesystems (like BoundOS) can handle absolute paths.
+				if reflect.TypeOf(d.fs) == reflect.TypeOf(&chroot.ChrootHelper{}) {
+					return nil, fmt.Errorf("alternates file contains absolute path %q but AlternatesFS is not configured", path)
+				}
 			}
+			fs = d.fs
 		}
 
 		if filepath.IsAbs(path) {

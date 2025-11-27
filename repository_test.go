@@ -1258,43 +1258,38 @@ func (s *RepositorySuite) TestPlainCloneSharedFixtureViaSymlink() {
 	s.NoError(err)
 }
 
-func (s *RepositorySuite) TestCloneSharedIntoMemfs() {
-	// This test attempts to reproduce macOS failures on Linux by using memfs.
-	// When cloning with Shared: true into a memfs-based filesystem storage,
-	// the alternates file will contain an absolute path on the OS filesystem,
-	// but the clone's storage is in memfs and cannot access those paths.
+func (s *RepositorySuite) TestCloneSharedIntoMemfsWithoutAlternatesFS() {
+	// This test verifies that when cloning with Shared: true into a memfs-based
+	// filesystem storage WITHOUT configuring AlternatesFS, the clone fails
+	// because it cannot access objects through alternates.
 	//
-	// This simulates the issue on macOS where the chrooted filesystem cannot
-	// cross boundaries to access alternates paths.
+	// The alternates file contains an absolute path on the OS filesystem,
+	// but the clone's storage is in memfs and has no AlternatesFS configured
+	// to access those paths.
+	//
+	// Users of Clone() (not PlainClone) must configure AlternatesFS on their
+	// storage if they want to use Shared clones.
 
 	// Get a local repository URL (on OS filesystem)
 	srcURL := s.GetBasicLocalRepositoryURL()
 
 	// Create a memfs-based filesystem storage for the destination
-	// This simulates a storage that cannot access OS filesystem paths
+	// WITHOUT AlternatesFS - this simulates incorrect usage
 	mfs := memfs.New()
 	dot, err := mfs.Chroot(".git")
 	s.NoError(err)
 	sto := filesystem.NewStorage(dot, cache.NewObjectLRUDefault())
 
 	// Clone using the Clone function (not PlainClone) with Shared: true
-	r, err := Clone(sto, mfs, &CloneOptions{
+	// This should fail because Clone sets up alternates but the storage
+	// cannot access the absolute paths without AlternatesFS
+	_, err = Clone(sto, mfs, &CloneOptions{
 		URL:    srcURL,
 		Shared: true,
 	})
-	// The clone should succeed (alternates file written), but object access may fail
-	s.NoError(err)
-
-	// Get HEAD
-	head, err := r.Head()
-	s.NoError(err)
-	s.NotNil(head)
-
-	// Try to access an object - this will fail if alternates cannot be resolved
-	// because the memfs cannot access the OS filesystem paths in alternates
-	commit, err := r.CommitObject(head.Hash())
-	s.NoError(err)
-	s.NotNil(commit)
+	// The clone should fail with an AlternatesFS-related error
+	s.Error(err)
+	s.Contains(err.Error(), "AlternatesFS is not configured")
 }
 
 func (s *RepositorySuite) TestPlainCloneSharedLocalNestedAlternates() {

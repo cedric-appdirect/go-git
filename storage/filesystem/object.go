@@ -370,7 +370,13 @@ func (s *ObjectStorage) EncodedObject(t plumbing.ObjectType, h plumbing.Hash) (p
 	// repository.
 	if errors.Is(err, plumbing.ErrObjectNotFound) {
 		dotgits, e := s.dir.Alternates()
-		if e == nil {
+		if e != nil {
+			// Only ignore file-not-found errors (no alternates file).
+			// Other errors (e.g., AlternatesFS not configured) should be reported.
+			if !os.IsNotExist(e) {
+				return nil, e
+			}
+		} else {
 			// Create a new object storage with the DotGit(s) and check for the
 			// required hash object. Skip when not found.
 			for _, dg := range dotgits {
