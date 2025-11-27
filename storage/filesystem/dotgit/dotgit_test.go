@@ -932,6 +932,69 @@ func TestAlternatesDupes(t *testing.T) {
 	assert.Len(t, dotgits, 1)
 }
 
+func TestAlternatesSymlinkWithChroot(t *testing.T) {
+	// This test reproduces an issue where alternates fail when:
+	// 1. The filesystem is a ChrootHelper
+	// 2. The alternates file contains a path outside the chroot (via symlink or different location)
+	// 3. The ChrootHelper cannot access paths outside its root
+	//
+	// This happens on macOS where /var -> /private/var, and when cloning:
+	//   - Source repo at /var/folders/.../source (symlink path)
+	//   - Dest repo at /private/var/folders/.../dest (resolved path)
+	//   - Alternates file contains /var/folders/.../source/.git/objects
+	//   - Dest's chroot root is /private/var/folders/.../dest/.git
+	//   - ChrootHelper can't access /var/... because it's outside its root
+
+	// Create real directory
+	realDir := t.TempDir()
+
+	// Create symlink in a different temp directory
+	linkParent := t.TempDir()
+	symlinkPath := filepath.Join(linkParent, "link")
+	err := os.Symlink(realDir, symlinkPath)
+	assert.NoError(t, err)
+
+	// Create source repo structure at real path
+	srcRealPath := filepath.Join(realDir, "source", ".git")
+	err = os.MkdirAll(filepath.Join(srcRealPath, "objects"), 0o700)
+	assert.NoError(t, err)
+
+	// Create dest repo structure at real path
+	destRealPath := filepath.Join(realDir, "dest", ".git")
+	err = os.MkdirAll(filepath.Join(destRealPath, "objects", "info"), 0o700)
+	assert.NoError(t, err)
+
+	// Write alternates file with SYMLINK path (not real path)
+	// This simulates what happens when you clone using a symlinked URL
+	srcViaSymlink := filepath.Join(symlinkPath, "source", ".git", "objects")
+	altFile := filepath.Join(destRealPath, "objects", "info", "alternates")
+	err = os.WriteFile(altFile, []byte(srcViaSymlink+"\n"), 0o644)
+	assert.NoError(t, err)
+
+	// Create a chrooted filesystem at the dest's REAL path
+	// This is what happens when PlainClone creates storage
+	baseFS := osfs.New(realDir)
+	destFS, err := baseFS.Chroot(filepath.Join("dest", ".git"))
+	assert.NoError(t, err)
+
+	// Create DotGit without AlternatesFS - this should now succeed
+	// because the Alternates() method automatically uses osfs.New("/")
+	// for absolute paths when AlternatesFS is not explicitly set.
+	// This is the fix for macOS where /var -> /private/var symlinks
+	// would cause failures when the chroot couldn't access paths outside its root.
+	dir := New(destFS)
+	dotgits, err := dir.Alternates()
+	assert.NoError(t, err, "should succeed even without AlternatesFS because absolute paths are auto-resolved with osfs.New(\"/\")")
+	assert.Len(t, dotgits, 1)
+
+	// Also verify it works with explicit AlternatesFS rooted at /
+	rootFS := osfs.New("/", osfs.WithBoundOS())
+	dirWithAltFS := NewWithOptions(destFS, Options{AlternatesFS: rootFS})
+	dotgits, err = dirWithAltFS.Alternates()
+	assert.NoError(t, err, "should succeed with AlternatesFS rooted at /")
+	assert.Len(t, dotgits, 1)
+}
+
 type norwfs struct {
 	billy.Filesystem
 }

@@ -22,6 +22,7 @@ import (
 
 	"github.com/go-git/go-billy/v6"
 	"github.com/go-git/go-billy/v6/helper/chroot"
+	"github.com/go-git/go-billy/v6/osfs"
 )
 
 const (
@@ -1179,11 +1180,6 @@ func (d *DotGit) Alternates() ([]*DotGit, error) {
 	}
 	defer f.Close()
 
-	fs := d.options.AlternatesFS
-	if fs == nil {
-		fs = d.fs
-	}
-
 	var alternates []*DotGit
 	seen := make(map[string]struct{})
 
@@ -1198,6 +1194,20 @@ func (d *DotGit) Alternates() ([]*DotGit, error) {
 		}
 
 		seen[path] = struct{}{}
+
+		// Determine which filesystem to use for accessing the alternate.
+		// For absolute paths, we need a filesystem that can access them,
+		// which may be different from the storage's filesystem (e.g., memfs).
+		fs := d.options.AlternatesFS
+		if fs == nil {
+			if filepath.IsAbs(path) {
+				// For absolute paths without an explicit AlternatesFS,
+				// use the OS filesystem rooted at / to access them.
+				fs = osfs.New("/", osfs.WithBoundOS())
+			} else {
+				fs = d.fs
+			}
+		}
 
 		if filepath.IsAbs(path) {
 			// Handling absolute paths should be straight-forward. However, the default osfs (Chroot)
