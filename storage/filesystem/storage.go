@@ -94,6 +94,12 @@ func (s *Storage) Filesystem() billy.Filesystem {
 	return s.fs
 }
 
+// AlternatesFS returns the filesystem used for resolving Git alternates.
+// This may be nil if no AlternatesFS was configured.
+func (s *Storage) AlternatesFS() billy.Filesystem {
+	return s.dir.AlternatesFS()
+}
+
 // Init initializes .git directory
 func (s *Storage) Init() error {
 	return s.dir.Initialize()

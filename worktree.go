@@ -582,10 +582,17 @@ func (w *Worktree) createWorkerTrees(t *object.Tree, numWorkers int) ([]*object.
 	if fsStorage, ok := w.r.Storer.(*filesystem.Storage); ok {
 		trees := make([]*object.Tree, numWorkers)
 
+		// Preserve AlternatesFS from the original storage so that worker
+		// storages can access objects through alternates (needed for Shared clones)
+		storageOpts := filesystem.Options{
+			AlternatesFS: fsStorage.AlternatesFS(),
+		}
+
 		for i := 0; i < numWorkers; i++ {
-			workerStorage := filesystem.NewStorage(
+			workerStorage := filesystem.NewStorageWithOptions(
 				fsStorage.Filesystem(),
 				cache.NewObjectLRUDefault(),
+				storageOpts,
 			)
 
 			workerTree, err := object.GetTree(workerStorage, t.Hash)

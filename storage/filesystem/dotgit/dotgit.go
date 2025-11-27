@@ -1259,6 +1259,12 @@ func (d *DotGit) Fs() billy.Filesystem {
 	return d.fs
 }
 
+// AlternatesFS returns the filesystem used for resolving Git alternates.
+// This may be nil if no AlternatesFS was configured.
+func (d *DotGit) AlternatesFS() billy.Filesystem {
+	return d.options.AlternatesFS
+}
+
 func isHex(s string) bool {
 	for _, b := range []byte(s) {
 		if isNum(b) {

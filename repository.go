@@ -321,10 +321,11 @@ func PlainInit(path string, isBare bool, options ...InitOption) (*Repository, er
 			return Init(s, oo...)
 		}
 	}
-	s := filesystem.NewStorageWithOptions(dot, cache.NewObjectLRUDefault(), filesystem.Options{
+	storageOpts := filesystem.Options{
 		ObjectFormat: o.objectFormat,
 		AlternatesFS: o.alternatesFS,
-	})
+	}
+	s := filesystem.NewStorageWithOptions(dot, cache.NewObjectLRUDefault(), storageOpts)
 	r, err := initFn(s)
 	if err != nil {
 		return nil, err
