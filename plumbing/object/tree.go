@@ -151,7 +151,7 @@ func (t *Tree) FindEntry(path string) (*TreeEntry, error) {
 	pathCurrent := ""
 
 	// search for the longest path in the tree path cache
-	for i := len(pathParts) - 1; i > 1; i-- {
+	for i := len(pathParts) - 1; i >= 1; i-- {
 		path := filepath.Join(pathParts[:i]...)
 
 		if cached, ok := t.t.Load(path); ok {
